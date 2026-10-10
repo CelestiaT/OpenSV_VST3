@@ -39,6 +39,7 @@
 | F-7 | QML 插件可起外部进程：`QProcess` 已注册（`MsProcess`） | `src/engraving/api/v1/qmlpluginapi.cpp:208` |
 | F-8 | 仅当插件自带 editor 时宿主才嵌入其 GUI；无 editor 则不出现 | `muse/framework/vst/qml/Muse/Vst/VstEditorDialog.qml` |
 | F-9 | OpenSV GUI 的实时播放 = 后台线程整工程渲染 + front/middle/back 三重缓冲 + phrase/voice/dict 三级缓存 | `OPSV_VST3/src/audio/PreviewEngine.h`、`ProjectRenderer.h` |
+| F-10 | **`MUSE_MODULE_VST` 默认 OFF**（OFF 时走 `stubs/vst`）：构建 MuseScore 须显式 `-DMUSE_MODULE_VST=ON`；`EXTENSIONS`/`AUDIOPLUGINS` 默认 ON | `MScore/muse/framework/cmake/MuseDeclareOptions.cmake:128`、`muse/framework/CMakeLists.txt:152`、`muse/framework/stubs/vst` |
 
 **推论（架构级决策）**：
 - 歌词/音素不走 MIDI 管线，走**工程桥文件**（§5）；时间对齐以 `projectTimeSamples` 为基准，
@@ -89,7 +90,10 @@
 - [x] clone cubeww/OpenSV 历史，建立 `upstream`/`niko` remote，分支 `feat/vst3`
 - [x] 本地引擎修复固化为 commit `2614296`
 - [x] `third_party/JUCE` submodule 就位（pin `be29c81492`，6.0.8+4638，JUCE 8 系）
-- [ ] `CMakeLists.txt` 拆出 `libopensv` OBJECT/STATIC 目标（不含 `src/ui`、`src/app`）
+      → 实际为 JUCE 9-main 线（参数位于 `juce_audio_processors_headless`，
+      入口仍是全局 `createPluginFilter()`；构建已验证）
+- [x] ~~拆出 libopensv~~：**上游已提供 `OpenSVEngine` STATIC 目标**
+      （core+synthesis+ProjectRenderer，零设备依赖），无需重构（2026-10-10 确认）
 - [ ] CI/本地脚本：`build.sh`（Ninja Release）+ `smoke.sh`（opensv-cli 渲染非静音阈值判定，
       直接移植成果包 `host/opensv-smoke.sh`）
 - [ ] 在 GitHub 上对 cubeww/OpenSV 使用 Fork 按钮建个人仓库后：
@@ -98,8 +102,9 @@
       README 说明是谱系的第二重表达）
 
 ### M1 VST3 空壳验证（1 天）——先证通路，再上真引擎
-交付：`OpenSV.vst3`（正弦/静音 synth，3 个演示参数，无 editor）。
-验收清单（全部在 MuseScore 里人工过一遍，任何一项不过须先解决再前进）：
+交付：`OpenSV.vst3`（正弦/静音 synth，7 个参数，无 editor）。**代码侧已完成**
+（`plugin/`，构建验证通过，产物含合法 `moduleinfo.json`+`ModuleEntry/GetPluginFactory` 导出）。
+验收需在 MuseScore 中人工走一遍 `docs/M1-VALIDATION.md`：
 - [ ] 把 `OpenSV.vst3` 放入 `~/.vst3`（或首选项添加扫描路径），设置 → 音频插件 扫描通过
 - [ ] 混音台把某轨输出路由到该插件，播放时收到 noteOn/noteOff
 - [ ] 插件 UI 入口不可见/不可点（F-8），宿主不崩溃
