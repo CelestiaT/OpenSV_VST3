@@ -125,6 +125,11 @@ if(MSVC)
     target_compile_options(OpenSVCli PRIVATE /utf-8 /permissive- /EHsc)
 endif()
 
+option(OPENSV_BUILD_PLUGIN_VST3 "Build the headless OpenSV VST3 instrument" ON)
+if(OPENSV_BUILD_PLUGIN_VST3)
+    add_subdirectory(plugin)
+endif()
+
 option(OPENSV_BUILD_INTERNAL_TOOLS "Build internal voice diagnostics" OFF)
 if(OPENSV_BUILD_INTERNAL_TOOLS)
     juce_add_console_app(OpenSVVoice
