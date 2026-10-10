@@ -114,20 +114,18 @@
       与宿主播放位置一致；拖动播放头后位置立即正确（F-4 成立性实测）
 - [ ] 重启 MuseScore 后参数/状态从 mscz 恢复（`getState/setState`）
 
-### M2 libopensv 抽取 + 插件内核（2–3 天）
-- [ ] `libopensv`：`Project`/`ProjectFile`（工程模型与 .svp 序列化）、
-      `VoiceDatabase`/`PhonemeDictionary`、`ProjectRenderer`（三级缓存）全部进静态库；
-      去除对 `AudioDeviceManager` 的依赖（它本来也只属于 `PreviewEngine`）
-- [ ] 插件 `AudioProcessor`：
-  - `processBlock`：从 front slot 按 `projectTimeSamples - trackStartSample` 取样输出；
-    越界静音；句边界 5–10ms 等功率交叉淡化（`PreviewEngine::renderPlayback` 的移植）
-  - 渲染线程：直接继承 `juce::Thread` 语义 —— 照搬 `PreviewEngine` 的
-    `requestedRevision/completedRevision/middleSlot` 协议（F-9），不重新发明
-  - `setNumChannels`/`prepareToPlay`：48k 固定内部采样率或跟随宿主 spec（首选跟随宿主，
-    `ProjectRenderer::render(project, sampleRate, ...)` 已参数化）
-- [ ] 音源数据源：M2 阶段先接受 **JUCE 插件内的 MIDI note 收集 + 桥 JSON** 双源，
-      桥 JSON 为准，MIDI 仅用于"桥缺失时发元音 `a` 的兜底"与对齐校验
-- 验收：C5 测试——同一工程分别经 `opensv-cli` 与插件内部渲染，输出 PCM 差 < 1e-6
+### M2 插件内核（原估 2–3 天）—— **M2a 完成 2026-10-10（headless smoke 双声库 PASS）**
+（C1 取消：上游已有 `OpenSVEngine` STATIC，仅需补 `POSITION_INDEPENDENT_CODE ON`）
+- [x] `plugin/src/EngineBridge`：notes（绝对秒）→ `sv::Project`（120bpm blick 网格无损互逆）
+      → `ProjectRenderer` 后台整曲 → `atomic<shared_ptr<RenderedAudio>>` 发布；
+      安全归一化（peak>0.95 → ≈-1 dBFS，实测 AI 声库原始峰值可 >1）
+- [x] `processBlock`：宿主 `projectTimeSamples`（缺失时块累计）取样，seek 天然对齐；
+      无渲染结果时回退正弦占位
+- [x] 声库配置轮询：`~/.local/share/opensv-vst3/config.json`
+      （voice/dict/language/lyric），免重启切换；停止播放或 Sync Now 提交音符触发重渲
+- [x] `OpenSVEngineSmoke` 无 GUI 测试目标（可进 CI）
+- [ ] M2b：double 总线、lookahead 增量调度、AppImage 实机回归 M1 清单
+- 验收补充：与 `opensv-cli` 同一 .svp 的逐样本差对比留到 M2b（需要桥先就位更自然）
 
 ### M3 桥协议与加载器（1–2 天）
 - [ ] `BridgeLoader`：`std::atomic<uint64_t>` 文件指纹（mtime+size+内容 hash），
