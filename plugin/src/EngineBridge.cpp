@@ -195,8 +195,13 @@ sv::Project EngineBridge::buildProject() const
     track.voice.language = cfg.language;
 
     track.mainGroup.notes.clear();
+    // Sort + de-overlap: collection order can be scrambled by seeks/previews,
+    // and stable ascending times are what keep the phrase cache hittable.
+    std::vector<NoteRec> sorted = notes;
+    std::sort(sorted.begin(), sorted.end(), [](const NoteRec& a, const NoteRec& b)
+              { return a.startSec < b.startSec; });
     double lastEnd = 0.0;
-    for (const auto& note : notes)
+    for (const auto& note : sorted)
     {
         if (note.pitch <= 0)
             continue;

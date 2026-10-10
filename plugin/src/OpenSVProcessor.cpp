@@ -99,7 +99,7 @@ OpenSVProcessor::OpenSVProcessor()
         juce::ParameterID{ idAttenuation, 5 }, "Attenuation",
         juce::NormalisableRange<float>{ 0.0f, 1.0f, 0.001f }, 0.8f);
     auto testTone = std::make_unique<juce::AudioParameterBool>(
-        juce::ParameterID{ idTestTone, 6 }, "Test Tone (M1)", true);
+        juce::ParameterID{ idTestTone, 6 }, "Test Tone", false);
     auto syncNow = std::make_unique<juce::AudioParameterBool>(
         juce::ParameterID{ idSyncNow, 7 }, "Sync Now", false);
 
@@ -210,8 +210,10 @@ void OpenSVProcessor::processBuffer(juce::AudioBuffer<FloatType>& buffer, juce::
     {
         buffer.applyGain(0, numSamples, controls.attenuation);
     }
-    else if (controls.testTone)
+    else if (controls.testTone && lastPlaying.load())
     {
+        // Sine audition only while the host reports playback; clicking notes
+        // for preview must never blast the placeholder tone (user report).
         const double gain = static_cast<double>(controls.attenuation) * 0.25;
         const double attackInc = 1.0 / (kAttackSeconds * sampleRate);
         const double releaseInc = 1.0 / (kReleaseSeconds * sampleRate);
@@ -423,9 +425,10 @@ void OpenSVProcessor::triggerCommitRender()
     }
     if (!snapshot.empty())
     {
+        const auto committedCount = snapshot.size();
         engine.setNotes(std::move(snapshot));
         engine.commitAndRender();
-        logLine(juce::String("panel: committed ") + juce::String(static_cast<int>(snapshot.size()))
+        logLine(juce::String("panel: committed ") + juce::String(static_cast<int>(committedCount))
             + " notes -> render requested");
     }
     else
@@ -493,9 +496,10 @@ void OpenSVProcessor::timerCallback()
         }
         if (!snapshot.empty())
         {
+            const auto committedCount = snapshot.size();
             engine.setNotes(std::move(snapshot));
             engine.commitAndRender();
-            logLine(juce::String("committed ") + juce::String(static_cast<int>(snapshot.size()))
+            logLine(juce::String("committed ") + juce::String(static_cast<int>(committedCount))
                 + " notes -> render requested");
         }
     }

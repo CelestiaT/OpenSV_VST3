@@ -24,13 +24,13 @@ const char* kLanguages[] = { "japanese", "english", "mandarin", "cantonese", "sp
 OpenSVEditor::OpenSVEditor(OpenSVProcessor& owner)
     : AudioProcessorEditor(&owner), owner_(owner), bridge_(owner.engineBridge())
 {
-    setSize(480, 560);
-    setResizeLimits(440, 520, 1600, 1200);
+    setSize(460, 500);
+    setResizeLimits(430, 480, 1600, 1200);
 
     titleLabel_.setText("OpenSV — singing synthesis", juce::dontSendNotification);
     titleLabel_.setFont(juce::Font(18.0f, juce::Font::bold));
     titleLabel_.setColour(juce::Label::textColourId, juce::Colour{ kPanelText });
-    hintLabel_.setText("Voice banks and settings persist to config.json (hot-reloaded).",
+    hintLabel_.setText("Voice bank settings persist to config.json (hot-reloaded). Lyrics need the score bridge (M3).",
                        juce::dontSendNotification);
     hintLabel_.setFont(juce::Font(11.0f));
     hintLabel_.setColour(juce::Label::textColourId, juce::Colour{ kDimText });
@@ -192,13 +192,14 @@ void OpenSVEditor::resized()
     auto row = [&](juce::Label& label, juce::Component& first, juce::Component* second,
                    int secondW)
     {
-        label.setBounds(area.removeFromTop(rowH).withWidth(labelW));
-        const juce::Rectangle<int> rest{ area.getX() + labelW + gap, area.getY(),
-                                         area.getWidth() - labelW - gap, rowH };
+        const int x = area.getX();
+        const int y = area.getY();
+        label.setBounds(x, y, labelW, rowH);
+        const juce::Rectangle<int> rest{ x + labelW + gap, y, area.getWidth() - labelW - gap, rowH };
         if (second != nullptr)
         {
             first.setBounds(rest.withWidth(rest.getWidth() - secondW - gap));
-            second->setBounds(rest.getRight() - secondW, rest.getY(), secondW, rowH);
+            second->setBounds(rest.getRight() - secondW, y, secondW, rowH);
         }
         else
         {
