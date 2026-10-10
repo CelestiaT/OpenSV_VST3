@@ -30,7 +30,29 @@ int main(int argc, char** argv)
     cfg.dictionary = argv[2];
     cfg.language = "japanese";
     cfg.lyric = "la";
+    cfg.scanDirs = { juce::File(argv[1]).getParentDirectory().getFullPathName().toStdString() };
     bridge.setConfig(cfg);
+
+    // Round-trip the persistence path the editor panel uses on every edit.
+    // (Run with XDG_CONFIG_HOME pointed at a temp dir to stay out of the user's config.)
+    if (!bridge.saveConfigFile())
+    {
+        std::printf("FAIL: saveConfigFile could not write %s\n",
+                    EngineBridge::defaultConfigFile().getFullPathName().toRawUTF8());
+        return 3;
+    }
+    {
+        EngineBridge probe;
+        const auto wantVoice = juce::File(argv[1]).getFullPathName();
+        if (!probe.loadConfigFile(EngineBridge::defaultConfigFile())
+            || juce::String(probe.config().voiceBank) != wantVoice
+            || probe.config().scanDirs != cfg.scanDirs)
+        {
+            std::printf("FAIL: config file did not survive save/load round trip\n");
+            return 3;
+        }
+        std::printf("config round-trip OK (voice + scanDirs persisted)\n");
+    }
 
     // C-major-ish arpeggio sung with "la": 8 quarter notes at 120bpm, ~0.5s each.
     std::vector<EngineBridge::NoteRec> notes;

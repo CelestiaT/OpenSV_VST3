@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace opensv::plugin
 {
@@ -37,6 +38,10 @@ EngineBridge::~EngineBridge()
 
 juce::File EngineBridge::defaultConfigFile()
 {
+    // Test / multi-instance override; must be an absolute path.
+    if (const char* env = std::getenv("OPENSV_CONFIG"); env != nullptr && env[0] != '\0')
+        return juce::File{ juce::CharPointer_UTF8{ env } };
+
     return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
         .getChildFile("opensv-vst3")
         .getChildFile("config.json");
@@ -60,9 +65,59 @@ bool EngineBridge::loadConfigFile(const juce::File& file)
     const juce::String lyric = jsonField(parsed, "lyric");
     if (lyric.isNotEmpty())
         next.lyric = lyric.toStdString();
+    if (const juce::var dirsVar = parsed["scanDirs"]; dirsVar.isArray())
+        for (const auto& v : *dirsVar.getArray())
+            next.scanDirs.emplace_back(v.toString().toStdString());
 
     setConfig(next);
     return true;
+}
+
+bool EngineBridge::saveConfigFile() const
+{
+    const Config snapshot = config();
+
+    auto esc = [](juce::String s) { return s.replace("\\", "\\\\").replace("\"", "\\\""); };
+    juce::String text = "{\n"
+        "  \"voice\": \"" + esc(snapshot.voiceBank) + "\",\n"
+        "  \"dict\": \"" + esc(snapshot.dictionary) + "\",\n"
+        "  \"language\": \"" + esc(juce::String(snapshot.language)) + "\",\n"
+        "  \"lyric\": \"" + esc(juce::String(snapshot.lyric)) + "\",\n"
+        "  \"scanDirs\": [\n";
+    for (std::size_t i = 0; i < snapshot.scanDirs.size(); ++i)
+        text += "    \"" + esc(juce::String(snapshot.scanDirs[i])) + "\""
+              + (i + 1 < snapshot.scanDirs.size() ? "," : "") + "\n";
+    text += "  ]\n}\n";
+
+    const juce::File file = defaultConfigFile();
+    file.getParentDirectory().createDirectory();
+    return file.replaceWithText(text);
+}
+
+std::vector<juce::File> EngineBridge::scanVoiceBanks() const
+{
+    const Config snapshot = config();
+    std::vector<juce::File> roots;
+    if (!snapshot.voiceBank.empty())
+        roots.push_back(juce::File(snapshot.voiceBank).getParentDirectory());
+    for (const auto& d : snapshot.scanDirs)
+        roots.emplace_back(d);
+
+    std::vector<juce::File> found;
+    for (const auto& dir : roots)
+    {
+        if (!dir.isDirectory())
+            continue;
+        for (const juce::File& f : dir.findChildFiles(juce::File::findFiles, false, "*.nofs"))
+        {
+            if (!std::any_of(found.begin(), found.end(),
+                             [&](const juce::File& x) { return x.getFullPathName() == f.getFullPathName(); }))
+                found.push_back(f);
+        }
+    }
+    std::sort(found.begin(), found.end(), [](const juce::File& a, const juce::File& b)
+              { return a.getFileNameWithoutExtension().compare(b.getFileNameWithoutExtension()) < 0; });
+    return found;
 }
 
 EngineBridge::Config EngineBridge::config() const
@@ -71,12 +126,20 @@ EngineBridge::Config EngineBridge::config() const
     return cfg;
 }
 
-void EngineBridge::setConfig(const Config& next)
+void EngineBridge::setConfig(const Config& nextIn)
 {
+    Config next = nextIn;
+    // Normalise to absolute paths: the config file and hosts' cwd must not
+    // change what "voice"/"dict" resolve to.
+    if (!next.voiceBank.empty())
+        next.voiceBank = juce::File(next.voiceBank).getFullPathName().toStdString();
+    if (!next.dictionary.empty())
+        next.dictionary = juce::File(next.dictionary).getFullPathName().toStdString();
     {
         const std::lock_guard<std::mutex> lock(dataMutex);
         if (next.voiceBank == cfg.voiceBank && next.dictionary == cfg.dictionary
-            && next.language == cfg.language && next.lyric == cfg.lyric)
+            && next.language == cfg.language && next.lyric == cfg.lyric
+            && next.scanDirs == cfg.scanDirs)
             return;
         cfg = next;
     }

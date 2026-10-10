@@ -1,9 +1,11 @@
 // OpenSV VST3 instrument — headless processor (M1 plumbing shell).
 // Implementation notes: docs/PLAN.md §4 M1, §6 parameter table.
 #include "OpenSVProcessor.h"
+#include "EditorPanel.h"
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
 
 namespace opensv::plugin
 {
@@ -24,26 +26,56 @@ constexpr std::int32_t kStateMagic = 0x4F535631; // 'OSV1'
 
 juce::File logFile()
 {
-    // XDG-friendly: ~/.local/share/OpenSV/logs/vst3.log
+    // JUCE on Linux maps userApplicationDataDirectory to $XDG_CONFIG_HOME,
+    // so this lands at ~/.config/OpenSV/logs/vst3.log
     return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
         .getChildFile("OpenSV")
         .getChildFile("logs")
         .getChildFile("vst3.log");
 }
 
-juce::FileLogger& fileLogger()
+// Thread-safe async logging: any thread (including the audio callback) only
+// enqueues under a short mutex; the message-thread timer drains to disk.
+// (juce::Logger::getCurrentContext() is thread-local and FileLogger is not
+// concurrency-safe — both silently dropped audio-thread lines before.)
+std::mutex& logMutex()
 {
-    static std::unique_ptr<juce::FileLogger> instance = []
-    {
-        return std::unique_ptr<juce::FileLogger>(
-            new juce::FileLogger(logFile(), "OpenSV VST3 log", 4 << 20));
-    }();
-    return *instance;
+    static std::mutex m;
+    return m;
+}
+
+std::deque<juce::String>& logQueue()
+{
+    static std::deque<juce::String> q;
+    return q;
 }
 
 void logLine(const juce::String& text)
 {
-    fileLogger().writeToLog(text);
+    const std::lock_guard<std::mutex> lock(logMutex());
+    if (logQueue().size() < 1024)
+        logQueue().push_back(juce::Time::getCurrentTime().toString(true, true, true, false) + "  " + text);
+}
+
+void flushLogs()
+{
+    juce::StringArray lines;
+    {
+        const std::lock_guard<std::mutex> lock(logMutex());
+        while (!logQueue().empty())
+        {
+            lines.add(logQueue().front());
+            logQueue().pop_front();
+        }
+    }
+    if (lines.isEmpty())
+        return;
+
+    const juce::File file = logFile();
+    file.getParentDirectory().createDirectory();
+    if (!file.existsAsFile())
+        file.appendText("OpenSV VST3 log\n", false, false, "\n");
+    file.appendText(lines.joinIntoString("\n") + "\n", false, false, "\n");
 }
 } // namespace
 
@@ -382,8 +414,47 @@ juce::String OpenSVProcessor::probeSummary() const
         + " syncRequests=" + juce::String(syncRequests.load());
 }
 
+void OpenSVProcessor::triggerCommitRender()
+{
+    std::vector<EngineBridge::NoteRec> snapshot;
+    {
+        const juce::ScopedLock lock(pendingNotesCS);
+        snapshot = pendingNotes;
+    }
+    if (!snapshot.empty())
+    {
+        engine.setNotes(std::move(snapshot));
+        engine.commitAndRender();
+        logLine(juce::String("panel: committed ") + juce::String(static_cast<int>(snapshot.size()))
+            + " notes -> render requested");
+    }
+    else
+    {
+        engine.commitAndRender();
+        logLine("panel: render requested (no collected notes yet)");
+    }
+    flushLogs();
+}
+
+void OpenSVProcessor::reloadConfigFile()
+{
+    const juce::File file = EngineBridge::defaultConfigFile();
+    if (engine.loadConfigFile(file))
+        logLine("panel: config reloaded from " + file.getFullPathName());
+    else
+        logLine("panel: config not loaded (missing or invalid) " + file.getFullPathName());
+    flushLogs();
+}
+
+juce::AudioProcessorEditor* OpenSVProcessor::createEditor()
+{
+    return new OpenSVEditor(*this);
+}
+
 void OpenSVProcessor::timerCallback()
 {
+    flushLogs();
+
     // ---- config watch (voice bank swap without restart) ----
     static juce::Time nextConfigCheck{};
     const juce::Time now = juce::Time::getCurrentTime();

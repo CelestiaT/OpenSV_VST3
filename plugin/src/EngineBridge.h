@@ -51,6 +51,7 @@ public:
         std::string dictionary;       // clf-data dir
         std::string language = "japanese";
         std::string lyric = "la";     // G2P fallback syllable for MIDI mode
+        std::vector<std::string> scanDirs; // extra folders to list *.nofs from
     };
 
     struct Status
@@ -66,8 +67,10 @@ public:
 
     static juce::File defaultConfigFile();
     bool loadConfigFile(const juce::File& file); // returns true when changed
+    bool saveConfigFile() const;                 // write current cfg back
     Config config() const;
     void setConfig(const Config& cfg);           // bumps revision
+    std::vector<juce::File> scanVoiceBanks() const; // *.nofs across cfg dirs
 
     void setNotes(std::vector<NoteRec> notes);   // bumps revision (debounced)
     [[nodiscard]] std::size_t noteCount() const;
@@ -80,6 +83,7 @@ public:
     bool renderInto(juce::AudioBuffer<float>& buffer, std::int64_t absoluteStartSample);
 
     bool isRendering() const { return renderingFlag.load(); }
+    bool hasAudio() const { return publishedAudio.load() != nullptr; }
     Status status() const;
 
     // test hook: skip transport gating, render on demand (unit/debug).

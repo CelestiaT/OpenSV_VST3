@@ -1,9 +1,11 @@
-// OpenSV VST3 instrument — headless processor (M1 plumbing shell).
+// OpenSV VST3 instrument — singing-synthesis processor with a small native
+// control panel (voice bank pick + expression sliders + render status).
 //
 // Design contract (docs/PLAN.md):
-//   * No editor is ever created (hasEditor() == false). All user-facing
-//     controls live in the MuseScore-side QML bridge plugin (C4) and in the
-//     VST3 parameter list rendered by the host.
+//   * The editor is our own minimal panel, NOT the OpenSV standalone GUI.
+//     The full score/lyric UI stays on the MuseScore side (QML bridge, M4).
+//   * Voice banks, dictionary, language and placeholder syllable live in
+//     config.json next to the log file and are hot-reloaded (1 s poll).
 //   * M1 scope: parameters, state persistence, MIDI intake, transport probing
 //     and a test-tone audition. OpenSVEngine is wired into processBlock in M2
 //     behind this same skeleton.
@@ -42,8 +44,8 @@ public:
     void processBlock(juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
     void processBlock(juce::AudioBuffer<double>&, juce::MidiBuffer&) override;
 
-    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
-    bool hasEditor() const override { return false; }
+    juce::AudioProcessorEditor* createEditor() override;
+    bool hasEditor() const override { return true; }
 
     const juce::String getName() const override { return "OpenSV"; }
 
@@ -63,6 +65,11 @@ public:
 
     // -- probing helpers (M1 validation, see docs/M1-VALIDATION.md) ----------
     juce::String probeSummary() const;
+
+    // -- editor panel access ---------------------------------------------------
+    EngineBridge& engineBridge() { return engine; }
+    void triggerCommitRender();      // commit collected notes and render now
+    void reloadConfigFile();         // re-read config.json from disk
 
 private:
     void timerCallback() override; // message-thread logging; no GUI
