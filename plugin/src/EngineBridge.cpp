@@ -148,8 +148,23 @@ void EngineBridge::setConfig(const Config& nextIn)
 
 // ------------------------------------------------------------------ notes
 
+namespace
+{
+void sortAndUniqueNotes(std::vector<EngineBridge::NoteRec>& v)
+{
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b)
+              { return a.startSec < b.startSec || (a.startSec == b.startSec && a.endSec < b.endSec); });
+    v.erase(std::unique(v.begin(), v.end(), [](const auto& a, const auto& b)
+              { return std::abs(a.startSec - b.startSec) < 0.004
+                        && std::abs(a.endSec - b.endSec) < 0.004
+                        && a.pitch == b.pitch; }),
+            v.end());
+}
+} // namespace
+
 void EngineBridge::setNotes(std::vector<NoteRec> incoming)
 {
+    sortAndUniqueNotes(incoming);
     bool changed = false;
     {
         const std::lock_guard<std::mutex> lock(dataMutex);
@@ -158,6 +173,17 @@ void EngineBridge::setNotes(std::vector<NoteRec> incoming)
     }
     if (changed)
         requestedRevision.fetch_add(1);
+}
+
+std::vector<EngineBridge::NoteRec> EngineBridge::notesSorted() const
+{
+    std::vector<NoteRec> sorted;
+    {
+        const std::lock_guard<std::mutex> lock(dataMutex);
+        sorted = notes;
+    }
+    sortAndUniqueNotes(sorted);
+    return sorted;
 }
 
 std::size_t EngineBridge::noteCount() const
@@ -179,36 +205,35 @@ void EngineBridge::commitAndRender()
 
 // ------------------------------------------------------------------ project
 
-sv::Project EngineBridge::buildProject() const
+sv::Project EngineBridge::buildProject(double upToSec, double& endOutSec) const
 {
-    const std::lock_guard<std::mutex> lock(dataMutex);
+    const Config snapshot = config();
 
     sv::Project project = sv::createEmptyProject();
     project.name = "MuseScore";
+    endOutSec = 0.0;
     if (project.tracks.empty())
         return project;
 
     sv::Track& track = project.tracks[0];
     track.name = "Lead";
-    track.voice.databasePath = cfg.voiceBank;
-    track.voice.dictionaryDirectory = cfg.dictionary;
-    track.voice.language = cfg.language;
+    track.voice.databasePath = snapshot.voiceBank;
+    track.voice.dictionaryDirectory = snapshot.dictionary;
+    track.voice.language = snapshot.language;
 
     track.mainGroup.notes.clear();
-    // Sort + de-overlap: collection order can be scrambled by seeks/previews,
-    // and stable ascending times are what keep the phrase cache hittable.
-    std::vector<NoteRec> sorted = notes;
-    std::sort(sorted.begin(), sorted.end(), [](const NoteRec& a, const NoteRec& b)
-              { return a.startSec < b.startSec; });
     double lastEnd = 0.0;
-    for (const auto& note : sorted)
+    for (const auto& note : notesSorted())
     {
         if (note.pitch <= 0)
             continue;
+        if (note.startSec >= upToSec)
+            break; // future material belongs to the next chunk
         // enforce strictly ascending, non-zero notes
         const double start = std::max(0.0, std::max(note.startSec, lastEnd));
         const double end = std::max(start + 0.01, note.endSec);
         lastEnd = end;
+        endOutSec = std::max(endOutSec, end);
 
         sv::Note out;
         out.id = sv::createNoteId();
@@ -216,9 +241,11 @@ sv::Project EngineBridge::buildProject() const
         out.duration = std::max<sv::Blick>(1, static_cast<sv::Blick>(
             std::llround((end - start) * kBlicksPerSecond)));
         out.pitch = note.pitch;
-        out.lyrics = cfg.lyric;
+        out.lyrics = snapshot.lyric;
         track.mainGroup.notes.push_back(std::move(out));
     }
+    if (!track.mainGroup.notes.empty())
+        endOutSec += 1.2; // musical tail so the last note of a chunk decays
     return project;
 }
 
@@ -238,12 +265,13 @@ void EngineBridge::run()
         }
 
         const Config snapshot = config();
-        if (snapshot.voiceBank.empty() || noteCount() == 0)
+        const std::vector<NoteRec> material = notesSorted();
+        if (snapshot.voiceBank.empty() || material.empty())
         {
             {
                 const std::lock_guard<std::mutex> lock(errorMutex);
                 lastError = snapshot.voiceBank.empty()
-                    ? "no voice bank configured (see ~/.config/opensv-vst3/config.json)"
+                    ? "no voice bank configured (open the OpenSV panel)"
                     : juce::String();
             }
             completedRevision.store(wanted);
@@ -254,21 +282,61 @@ void EngineBridge::run()
         cancelFlag.store(false);
 
         const double rate = [&] { const std::lock_guard<std::mutex> lock(dataMutex); return renderSampleRate; }();
-        const sv::Project project = buildProject();
 
-        auto audio = std::make_shared<RenderedAudio>();
-        audio->sampleRate = rate;
-        audio->revision = wanted;
-
-        const juce::Result result = renderer.render(
-            project, rate, audio->samples,
-            [this] { return cancelFlag.load() || threadShouldExit(); });
-
-        if (result.wasOk() && !cancelFlag.load() && !threadShouldExit())
+        // Streaming catch-up model: render forward in chunks and publish each
+        // completed chunk immediately, so playback can start after ~2 s of
+        // audio exists instead of waiting for the whole song. The renderer's
+        // phrase cache makes every re-render of unchanged lyrics free.
+        const std::string signature = snapshot.voiceBank + "|" + snapshot.dictionary
+            + "|" + snapshot.language + "|" + snapshot.lyric;
+        if (signature != cfgSignature)
         {
-            // Safety normalization: AI voices can render well above 0 dBFS
-            // (raw peak observed ~13x). Scale whole-song down to ~-1 dBFS
-            // when needed, matching what a listener expects from a stem.
+            cfgSignature = signature;
+            renderedUntilSec = -1.0;
+            prevMaterial.clear();
+        }
+        // Material that touches already-rendered territory forces a rebuild
+        // from 0 (cheap: unchanged phrases hit the cache).
+        const bool prefixStable = material.size() >= prevMaterial.size()
+            && std::equal(prevMaterial.begin(), prevMaterial.end(), material.begin());
+        if (!prefixStable)
+            renderedUntilSec = -1.0;
+
+        const double wantedEnd = material.back().endSec + 1.2;
+        wantedSecondsReport.store(wantedEnd);
+
+        bool superseded = false;
+        while (renderedUntilSec < wantedEnd - 0.001 && !cancelFlag.load() && !threadShouldExit())
+        {
+            if (requestedRevision.load() != wanted) { superseded = true; break; }
+
+            const double chunk = renderedUntilSec < 0.0 ? 2.5 : 6.0;
+            const double target = renderedUntilSec < 0.0
+                ? std::min(wantedEnd, chunk)
+                : std::min(wantedEnd, renderedUntilSec + chunk);
+
+            double endOut = 0.0;
+            const sv::Project sub = buildProject(target, endOut);
+            if (sub.tracks.empty() || sub.tracks[0].mainGroup.notes.empty())
+                break;
+
+            auto audio = std::make_shared<RenderedAudio>();
+            audio->sampleRate = rate;
+            audio->revision = wanted;
+
+            const juce::Result result = renderer.render(
+                sub, rate, audio->samples,
+                [this] { return cancelFlag.load() || threadShouldExit(); });
+
+            if (!result.wasOk())
+            {
+                const std::lock_guard<std::mutex> lock(errorMutex);
+                lastError = result.getErrorMessage();
+                break;
+            }
+            if (cancelFlag.load() || threadShouldExit() || requestedRevision.load() != wanted)
+            { superseded = true; break; }
+
             if (audio->samples.getNumSamples() > 0)
             {
                 const float peak = audio->samples.getMagnitude(0, audio->samples.getNumSamples());
@@ -277,17 +345,20 @@ void EngineBridge::run()
             }
 
             songSampleCount.store(audio->samples.getNumSamples());
+            renderedSecondsReport.store(endOut);
             publish(std::move(audio));
-            const std::lock_guard<std::mutex> lock(errorMutex);
-            lastError.clear();
-        }
-        else if (!result.wasOk())
-        {
-            const std::lock_guard<std::mutex> lock(errorMutex);
-            lastError = result.getErrorMessage();
+            renderedUntilSec = endOut;
+            {
+                const std::lock_guard<std::mutex> lock(errorMutex);
+                lastError.clear();
+            }
         }
 
-        completedRevision.store(wanted);
+        if (!superseded)
+        {
+            prevMaterial = material;
+            completedRevision.store(wanted);
+        }
         renderingFlag.store(false);
         if (onRenderFinished)
             onRenderFinished();
@@ -332,8 +403,8 @@ EngineBridge::Status EngineBridge::status() const
     Status out;
     out.rendering = renderingFlag.load();
     out.hasAudio = publishedAudio.load() != nullptr;
-    const double rate = [&] { const std::lock_guard<std::mutex> lock(dataMutex); return renderSampleRate; }();
-    out.songSeconds = static_cast<double>(songSampleCount.load()) / std::max(1.0, rate);
+    out.songSeconds = renderedSecondsReport.load();
+    out.wantedSeconds = wantedSecondsReport.load();
     const std::lock_guard<std::mutex> lock(errorMutex);
     out.error = lastError;
     return out;

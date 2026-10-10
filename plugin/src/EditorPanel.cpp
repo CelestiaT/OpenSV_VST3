@@ -353,11 +353,11 @@ void OpenSVEditor::timerCallback()
     line << (cfg.voiceBank.empty() ? "(none)" : juce::File(cfg.voiceBank).getFileNameWithoutExtension());
     line << "   notes: " << juce::String(static_cast<int>(bridge_.noteCount()));
     if (st.rendering)
-        line << "   RENDERING...";
+        line << "   rendering " << juce::String(st.songSeconds, 1) << "/" << juce::String(st.wantedSeconds, 1) << "s...";
     else if (st.hasAudio)
-        line << "   audio ready, song " << juce::String(st.songSeconds, 1) << "s";
+        line << "   audio ready (" << juce::String(st.songSeconds, 1) << "s)";
     else
-        line << "   idle (play once to collect notes)";
+        line << "   idle (notes stream in during playback)";
     if (st.error.isNotEmpty())
         line << "\nerror: " << st.error;
 

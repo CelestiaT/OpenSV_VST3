@@ -118,6 +118,7 @@ private:
 
     std::int64_t lastLoggedBlocks = 0;
     bool lastSyncTriggerValue = false;
+    std::int64_t lastSyncCount = 0;
 
     // ---- M2: engine wiring -------------------------------------------------
     EngineBridge engine;
@@ -127,6 +128,7 @@ private:
     std::int64_t fallbackPosSample = 0;                // when host gives no position
     bool lastTransportPlaying = false;
     juce::Time lastConfigCheck{};
+    std::atomic<std::int64_t> lastPushedNotes{ 0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(OpenSVProcessor)
 };

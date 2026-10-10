@@ -58,7 +58,8 @@ public:
     {
         bool rendering = false;
         bool hasAudio = false;
-        double songSeconds = 0.0;
+        double songSeconds = 0.0;     // rendered-so-far
+        double wantedSeconds = 0.0;   // full material length
         juce::String error;
     };
 
@@ -91,7 +92,8 @@ public:
 
 private:
     void run() override;
-    sv::Project buildProject() const;
+    sv::Project buildProject(double upToSec, double& endOutSec) const;
+    std::vector<NoteRec> notesSorted() const; // sorted + deduplicated
     void publish(std::shared_ptr<const RenderedAudio> audio);
 
     mutable std::mutex dataMutex;
@@ -107,6 +109,13 @@ private:
     juce::String lastError; // guarded by errorMutex for status()
     mutable std::mutex errorMutex;
     std::atomic<std::int64_t> songSampleCount{ 0 }; // at renderSampleRate
+    std::atomic<double> renderedSecondsReport{ 0.0 };
+    std::atomic<double> wantedSecondsReport{ 0.0 };
+
+    // worker-thread-only streaming state
+    double renderedUntilSec = -1.0;
+    std::string cfgSignature;
+    std::vector<NoteRec> prevMaterial;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(EngineBridge)
 };

@@ -459,11 +459,10 @@ void OpenSVProcessor::timerCallback()
     flushLogs();
 
     // ---- config watch (voice bank swap without restart) ----
-    static juce::Time nextConfigCheck{};
     const juce::Time now = juce::Time::getCurrentTime();
-    if (now >= nextConfigCheck)
+    if (now >= lastConfigCheck)
     {
-        nextConfigCheck = now + juce::RelativeTime::seconds(1.0);
+        lastConfigCheck = now + juce::RelativeTime::seconds(1.0);
         if (const juce::File cfgFile = EngineBridge::defaultConfigFile(); cfgFile.existsAsFile())
         {
             static juce::int64 lastMtime = -1;
@@ -477,31 +476,32 @@ void OpenSVProcessor::timerCallback()
         }
     }
 
-    // ---- commit collected notes when transport stops (and on demand) ----
+    // ---- stream collected notes into the engine as they arrive ----
+    // The worker renders forward in chunks and publishes each chunk, so sung
+    // audio catches up with (roughly 4x faster than) the 1x playback clock.
+    // No "play once, wait, play again" ceremony any more.
     const bool playing = lastPlaying.load();
-    const bool stoppedNow = lastTransportPlaying && !playing;
     lastTransportPlaying = playing;
 
-    std::int64_t syncCount = syncRequests.load();
-    static std::int64_t lastSyncCount = 0;
+    const std::int64_t syncCount = syncRequests.load();
     const bool syncPressed = syncCount != lastSyncCount;
     lastSyncCount = syncCount;
 
-    if (stoppedNow || syncPressed)
+    std::vector<EngineBridge::NoteRec> snapshot;
+    std::size_t pendingCount = 0;
     {
-        std::vector<EngineBridge::NoteRec> snapshot;
-        {
-            const juce::ScopedLock lock(pendingNotesCS);
-            snapshot = pendingNotes; // keep for repeat commits until re-collected
-        }
-        if (!snapshot.empty())
-        {
-            const auto committedCount = snapshot.size();
-            engine.setNotes(std::move(snapshot));
+        const juce::ScopedLock lock(pendingNotesCS);
+        snapshot = pendingNotes;
+        pendingCount = pendingNotes.size();
+    }
+    if (!snapshot.empty() && (syncPressed || pendingCount != lastPushedNotes.load()))
+    {
+        lastPushedNotes.store(static_cast<std::int64_t>(pendingCount));
+        engine.setNotes(std::move(snapshot));
+        if (syncPressed)
             engine.commitAndRender();
-            logLine(juce::String("committed ") + juce::String(static_cast<int>(committedCount))
-                + " notes -> render requested");
-        }
+        logLine(juce::String("streaming: ") + juce::String(static_cast<int>(pendingCount))
+            + " notes pushed to engine");
     }
 
     // ---- transport/activity log (throttled) ----
