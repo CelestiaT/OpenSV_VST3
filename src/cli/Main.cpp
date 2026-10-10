@@ -5,6 +5,7 @@
 #include "audio/WaveFile.h"
 #include "core/Project.h"
 #include "core/ProjectFile.h"
+#include "synthesis/DnniReader.h"
 
 #include <juce_core/juce_core.h>
 
@@ -13,6 +14,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -33,6 +36,7 @@ struct Options
     std::string dictionaryOverride;
     std::string languageOverride;
     double sampleRate = 48000.0;
+    std::string inspect;
     bool infoOnly = false;
     bool quiet = false;
 };
@@ -49,6 +53,7 @@ void printUsage(std::FILE* out)
         "      --dict <clf-data>   Use this pronunciation dictionary directory on every track\n"
         "      --language <name>   Override the singing language on every track (e.g. japanese)\n"
         "      --rate <hz>         Output sample rate (default 48000)\n"
+        "      --inspect <file>    Dump a .dnni / model container structure, then exit\n"
         "      --info              List tracks, voices and whether their files exist, then exit\n"
         "  -q, --quiet             Suppress progress messages\n"
         "  -h, --help              Show this help\n"
@@ -106,6 +111,10 @@ bool parseArgs(int argc, char** argv, Options& options, std::string& error)
                 return false;
             }
         }
+        else if (arg == "--inspect")
+        {
+            if (!next(options.inspect)) return false;
+        }
         else if (arg == "--info")
         {
             options.infoOnly = true;
@@ -130,12 +139,12 @@ bool parseArgs(int argc, char** argv, Options& options, std::string& error)
         }
     }
 
-    if (options.input.empty())
+    if (options.input.empty() && options.inspect.empty())
     {
         error = "no input project given";
         return false;
     }
-    if (!options.infoOnly && options.output.empty())
+    if (!options.infoOnly && options.output.empty() && options.inspect.empty())
     {
         error = "no output file given (use -o)";
         return false;
@@ -146,6 +155,76 @@ bool parseArgs(int argc, char** argv, Options& options, std::string& error)
 juce::File resolve(const std::string& path)
 {
     return juce::File::getCurrentWorkingDirectory().getChildFile(juce::String::fromUTF8(path.c_str()));
+}
+
+int inspectModel(const std::string& path)
+{
+    sv::synthesis::DnniReader reader;
+    if (const auto status = reader.load(resolve(path)); status.failed())
+    {
+        std::fprintf(stderr, "inspect: %s\n", status.getErrorMessage().toRawUTF8());
+        return 2;
+    }
+    const auto& nodes = reader.getNodes();
+    std::printf("%s\n  dnniVersion=%u nodes=%d\n", path.c_str(), static_cast<unsigned>(reader.getVersion()), static_cast<int>(nodes.size()));
+
+    std::map<std::string, int> typeCounts;
+    std::vector<char> referenced(nodes.size(), 0);
+    for (std::size_t index = 0; index < nodes.size(); ++index)
+    {
+        ++typeCounts[nodes[index].type];
+        for (const auto child : nodes[index].children)
+        {
+            if (child < nodes.size()) { referenced[child] = 1; }
+        }
+    }
+    std::printf("  types:");
+    for (const auto& [type, count] : typeCounts) { std::printf(" %s=%d", type.c_str(), count); }
+    std::printf("\n");
+
+    std::function<void(std::size_t, int)> walk = [&](std::size_t index, int depth)
+    {
+        const auto& n = nodes[index];
+        juce::String line;
+        for (int i = 0; i < depth; ++i) { line << "  "; }
+        line << "- " << n.type.c_str() << " id=" << juce::String::toHexString(n.typeId)
+             << " children=" << static_cast<int>(n.children.size())
+             << " payload=" << static_cast<long long>(n.payloadSize);
+        sv::synthesis::DnniMatrix matrix;
+        if (!reader.readFloatMatrix(index, matrix).failed())
+        {
+            line << " matrix=" << static_cast<int>(matrix.rows) << "x" << static_cast<int>(matrix.columns);
+        }
+        std::vector<float> vector;
+        if (!reader.readFloatVector(index, vector).failed())
+        {
+            line << " vector=" << static_cast<int>(vector.size());
+        }
+        std::fputs(line.toRawUTF8(), stdout);
+        std::fputc('\n', stdout);
+        if (depth >= 2)
+        {
+            if (!n.children.empty())
+            {
+                std::printf("%*s  ...(%d children hidden)\n", depth * 2, "", static_cast<int>(n.children.size()));
+            }
+            return;
+        }
+        for (const auto child : n.children) { walk(child, depth + 1); }
+    };
+
+    int roots = 0;
+    for (std::size_t index = 0; index < nodes.size(); ++index)
+    {
+        if (referenced[index] == 0)
+        {
+            ++roots;
+            std::printf("  [root %d]\n", roots);
+            walk(index, 1);
+        }
+    }
+    std::printf("  rootCount=%d\n", roots);
+    return 0;
 }
 
 void printInfo(const sv::Project& project)
@@ -176,6 +255,11 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "opensv-cli: %s\n\n", error.c_str());
         printUsage(stderr);
         return 1;
+    }
+
+    if (!options.inspect.empty())
+    {
+        return inspectModel(options.inspect);
     }
 
     std::signal(SIGINT, onSignal);

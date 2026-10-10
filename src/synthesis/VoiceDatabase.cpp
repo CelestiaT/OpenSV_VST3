@@ -63,12 +63,23 @@ bool isText(const juce::MemoryBlock& block, bool allowWhitespace)
         return true;
     }
     const auto* data = static_cast<const char*>(block.getData());
-    if (block.getSize() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-        !juce::CharPointer_UTF8::isValidString(data, static_cast<int>(block.getSize())))
+    // 官方容器定长存放字符串，值尾部常带 NUL 终止符/填充（实测 Hatsune Miku V4X Dark 的
+    // ".name" 值长 26 字节但有效文本更短），因此只校验去掉尾部 NUL 后的有效长度。
+    std::size_t used = block.getSize();
+    while (used > 0 && data[used - 1] == 0)
+    {
+        --used;
+    }
+    if (used == 0)
+    {
+        return true;
+    }
+    if (used > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        !juce::CharPointer_UTF8::isValidString(data, static_cast<int>(used)))
     {
         return false;
     }
-    return std::none_of(data, data + block.getSize(), [allowWhitespace](char value)
+    return std::none_of(data, data + used, [allowWhitespace](char value)
     {
         const auto byte = static_cast<unsigned char>(value);
         return byte == 0 || byte == 0x7f || (byte < 0x20 && !(allowWhitespace && (byte == '\n' || byte == '\r' || byte == '\t')));
@@ -80,7 +91,17 @@ bool isText(const juce::MemoryBlock& block, bool allowWhitespace)
  */
 juce::String textOf(const juce::MemoryBlock& block)
 {
-    return block.isEmpty() ? juce::String() : juce::String::fromUTF8(static_cast<const char*>(block.getData()), static_cast<int>(block.getSize()));
+    if (block.isEmpty())
+    {
+        return {};
+    }
+    const auto* data = static_cast<const char*>(block.getData());
+    std::size_t used = block.getSize();
+    while (used > 0 && data[used - 1] == 0)
+    {
+        --used;   // 同上：剪掉官方写入的尾部 NUL 填充
+    }
+    return juce::String::fromUTF8(data, static_cast<int>(used));
 }
 
 } // namespace
@@ -173,7 +194,15 @@ juce::Result VoiceDatabase::open(const juce::File& newFile)
         const auto keySize = readUint16(blockHeader.data() + 6);
         if (recordType != valueBlockType)
         {
-            return invalid("unsupported value block type at " + juce::String(static_cast<juce::int64>(offset)));
+            // 传统声库容器里还存在其它类型的数据块（实测 Hatsune Miku V4X Dark 在偏移 980526
+            // 处有 type=0x0100 的块，附近还有 timbre-*.gmmpt、psdres.weights 等 Shift-JIS 资）。
+            // 这些不是本引擎要读的记录，只要 recordSize 自洽就跳过，而不是拒容器。
+            if (recordSize < 12 || recordSize > fileSize - offset)
+            {
+                return invalid("unsupported value block with inconsistent size at " + juce::String(static_cast<juce::int64>(offset)));
+            }
+            offset += recordSize;
+            continue;
         }
         if (keySize == 0 || recordSize < 16u + keySize || recordSize > fileSize - offset)
         {
@@ -210,11 +239,10 @@ juce::Result VoiceDatabase::open(const juce::File& newFile)
         {
             return invalid("value length does not match its block");
         }
-        if (!readAt(*candidate, offset + recordSize - 4, lengthBytes.data(), static_cast<int>(lengthBytes.size())) ||
-            readUint32(lengthBytes.data()) != recordSize)
-        {
-            return invalid("value block trailer mismatch");
-        }
+        // 尾部 4 字节本应重复 recordSize，但官方旧声库并非总是写入（实测
+        // Hatsune Miku V4X Dark 的 ".version" 记录此处为 0，而 Teto AI 104 为 27）。
+        // recordSize 的可信度已由上一条 valueSize/keySize 一致性检查保证（两者差值
+        // 恰好就是这 4 字节），因此不再读取、也不再据此拒绝整个容器。
         parsed.push_back(std::move(entry));
         offset += recordSize;
     }

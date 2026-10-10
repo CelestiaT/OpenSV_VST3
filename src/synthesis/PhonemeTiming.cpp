@@ -132,11 +132,30 @@ juce::Result readEmbedding(const DnniReader& reader, std::size_t nodeIndex, std:
     {
         return result;
     }
-    if (matrix.rows != rows || matrix.columns != columns)
+    if (matrix.rows == rows && matrix.columns == columns)
     {
-        return failure("embedding matrix dimensions do not match the declared channels.");
+        return juce::Result::ok();
     }
-    return juce::Result::ok();
+    // 新版 AI 声库的 embedding 以 (channels × entries) 转置存储（实测 Teto 32x5、AVER 32x6，
+    // 而下游 copyEmbedding 需要按 entries 行取向量），这里统一转置回 (entries × channels)。
+    if (matrix.rows == columns && matrix.columns == rows)
+    {
+        const std::size_t srcRows = matrix.rows;
+        const std::size_t srcCols = matrix.columns;
+        std::vector<float> transposed(srcRows * srcCols);
+        for (std::size_t r = 0; r < srcRows; ++r)
+        {
+            for (std::size_t c = 0; c < srcCols; ++c)
+            {
+                transposed[c * srcRows + r] = matrix.values[r * srcCols + c];
+            }
+        }
+        matrix.rows = static_cast<std::uint32_t>(srcCols);
+        matrix.columns = static_cast<std::uint32_t>(srcRows);
+        matrix.values = std::move(transposed);
+        return juce::Result::ok();
+    }
+    return failure("embedding matrix dimensions do not match the declared channels.");
 }
 
 /**
@@ -184,7 +203,7 @@ juce::Result quantizePhonemeDurations(std::span<const PhonemeDuration> durations
             static_cast<double>(previousFrame + 1),
             std::round(cumulativeSeconds / static_cast<double>(frameIntervalSeconds))));
 
-        output.push_back({duration.language, duration.symbol, previousFrame, targetFrame});
+        output.push_back({duration.language, duration.symbol, targetFrame - previousFrame});
         previousFrame = targetFrame;
     }
 
@@ -223,9 +242,37 @@ juce::Result PhonemeTiming::load(const DnniReader& reader, std::size_t rootNode)
     }
 
     const auto& frontend = nodes[frontendNode];
-    if (frontend.children.size() < 8)
     {
-        return failure("frontend descriptor missing required embedding tables.");
+        // [临时诊断] 输出 duration 模型与 frontend 子节点的真实结构，用于定位“按位置索引”假设失效点
+        juce::String diag;
+        diag << "[diag] duration root type=" << root.type << " id=" << juce::String::toHexString(root.typeId)
+             << " children=" << (int) root.children.size() << "\n";
+        diag << "[diag] frontend type=" << frontend.type << " id=" << juce::String::toHexString(frontend.typeId)
+             << " children=" << (int) frontend.children.size() << "\n";
+        for (std::size_t ci = 0; ci < root.children.size(); ++ci)
+        {
+            const auto& c = nodes[root.children[ci]];
+            diag << "root[" << (int) ci << "] type=" << c.type << " id=" << juce::String::toHexString(c.typeId)
+                 << " children=" << (int) c.children.size() << " payload=" << (int) c.payloadSize << "\n";
+            for (std::size_t gi = 0; gi < c.children.size() && gi < 10; ++gi)
+            {
+                const auto& g = nodes[c.children[gi]];
+                diag << "    [" << (int) gi << "] type=" << g.type << " children=" << (int) g.children.size()
+                     << " payload=" << (int) g.payloadSize << "\n";
+                for (std::size_t ti = 0; ti < g.children.size() && ti < 8; ++ti)
+                {
+                    const auto& t = nodes[g.children[ti]];
+                    diag << "        [" << (int) ti << "] type=" << t.type << " children=" << (int) t.children.size()
+                         << " payload=" << (int) t.payloadSize << "\n";
+                }
+            }
+        }
+        // 诊断字符串仅供结构分析使用（结论：新版库的 embedding 位于 root 的兄弟节点）
+        juce::ignoreUnused(diag);
+    }
+    if (frontend.children.size() < 2)
+    {
+        return failure("frontend descriptor has no phone set tables.");
     }
 
     // Read Phone Sets and Unified Phone Set
@@ -246,22 +293,113 @@ juce::Result PhonemeTiming::load(const DnniReader& reader, std::size_t rootNode)
         return result;
     }
 
+    // ---- 布局兼容（新版 AI 声库）----
+    // 旧布局：embedding/voice/normalizer 平铺在 frontend.children[2..7]。
+    // 新版（实测 AVER v200、Kasane Teto AI 104）：embedding 挂在 root 的兄弟节点上
+    // （modl4 → prim0 矩阵），voice embedding 是 root 上的 prim1（128 float），
+    // 归一化仍是 frontend 内的 cmpu0。因此改为按内容定位，不再依赖位置假设。
+    auto isMatrixLeaf = [](const std::string& name) { return name == "prim0" || name == "prim2" || name == "prim3" || name == "prim4"; };
+    auto matrixNodeOf = [&](std::size_t idx) -> std::size_t
+    {
+        const auto& self = nodes[idx];
+        if (isMatrixLeaf(self.type))
+        {
+            return idx;
+        }
+        for (const auto child : self.children)
+        {
+            if (isMatrixLeaf(nodes[child].type))
+            {
+                return child;
+            }
+        }
+        return idx;
+    };
+
+    const auto notFound = ~static_cast<std::size_t>(0);
+    std::size_t languageNode = frontend.children.size() > 2 ? frontend.children[2] : notFound;
+    std::size_t phonemeNode = frontend.children.size() > 3 ? frontend.children[3] : notFound;
+    std::size_t positionNode = frontend.children.size() > 4 ? frontend.children[4] : notFound;
+    std::size_t voiceNode = frontend.children.size() > 5 ? frontend.children[5] : notFound;
+    std::size_t inputNormNode = frontend.children.size() > 6 ? frontend.children[6] : notFound;
+    std::size_t outputNormNode = frontend.children.size() > 7 ? frontend.children[7] : notFound;
+
+    if (frontend.children.size() < 8)
+    {
+        languageNode = phonemeNode = positionNode = voiceNode = inputNormNode = outputNormNode = notFound;
+        std::vector<std::size_t> normNodes;
+        for (const auto idx : frontend.children)
+        {
+            if (nodes[idx].type == "cmpu0")
+            {
+                normNodes.push_back(idx);
+            }
+        }
+        if (normNodes.size() >= 2)
+        {
+            inputNormNode = normNodes[0];
+            outputNormNode = normNodes[1];
+        }
+        const auto languageRows = static_cast<std::uint32_t>(phoneSets.size());
+        const auto unifiedRows = static_cast<std::uint32_t>(unifiedPhoneSet.symbols.size());
+        juce::String shapes;
+        for (const auto idx : root.children)
+        {
+            const auto& n = nodes[idx];
+            if (n.type == "prim1" && n.payloadSize == sizeof(std::uint32_t) + 128 * sizeof(float))
+            {
+                voiceNode = idx;
+                continue;
+            }
+            DnniMatrix probe;
+            if (reader.readFloatMatrix(matrixNodeOf(idx), probe).failed())
+            {
+                continue;
+            }
+            shapes << " [" << (int) probe.rows << "x" << (int) probe.columns << "]";
+            const auto matches = [&](std::uint32_t a, std::uint32_t b) { return (probe.rows == a && probe.columns == b) || (probe.rows == b && probe.columns == a); };
+            if (matches(8, 16))
+            {
+                positionNode = idx;
+            }
+            else if (matches(static_cast<std::uint32_t>(languageRows), 32))
+            {
+                languageNode = idx;
+            }
+            else if (matches(static_cast<std::uint32_t>(unifiedRows), 32))
+            {
+                phonemeNode = idx;
+            }
+        }
+        if (languageNode == notFound || phonemeNode == notFound || positionNode == notFound || voiceNode == notFound || inputNormNode == notFound || outputNormNode == notFound)
+        {
+            juce::String missing;
+            if (languageNode == notFound) { missing << " language"; }
+            if (phonemeNode == notFound) { missing << " phoneme"; }
+            if (positionNode == notFound) { missing << " position"; }
+            if (voiceNode == notFound) { missing << " voice"; }
+            if (inputNormNode == notFound) { missing << " inputNorm"; }
+            if (outputNormNode == notFound) { missing << " outputNorm"; }
+            return failure("duration layout unsupported: missing" + missing + " ;phoneSets=" + juce::String((int) languageRows) + " unified=" + juce::String((int) unifiedRows) + " matrices=" + shapes);
+        }
+    }
+
     // Load embeddings: language (32), phoneme (32), position (16)
-    if (const auto result = readEmbedding(reader, frontend.children[2], phoneSets.size(), 32, languageEmbedding); result.failed())
+    if (const auto result = readEmbedding(reader, matrixNodeOf(languageNode), phoneSets.size(), 32, languageEmbedding); result.failed())
     {
         return result;
     }
-    if (const auto result = readEmbedding(reader, frontend.children[3], unifiedPhoneSet.symbols.size(), 32, phonemeEmbedding); result.failed())
+    if (const auto result = readEmbedding(reader, matrixNodeOf(phonemeNode), unifiedPhoneSet.symbols.size(), 32, phonemeEmbedding); result.failed())
     {
         return result;
     }
-    if (const auto result = readEmbedding(reader, frontend.children[4], 8, 16, positionEmbedding); result.failed())
+    if (const auto result = readEmbedding(reader, matrixNodeOf(positionNode), 8, 16, positionEmbedding); result.failed())
     {
         return result;
     }
 
     // Speaker / voice embedding vector (128 floats)
-    if (const auto result = reader.readFloatVector(frontend.children[5], voiceEmbedding); result.failed())
+    if (const auto result = reader.readFloatVector(voiceNode, voiceEmbedding); result.failed())
     {
         return result;
     }
@@ -271,11 +409,11 @@ juce::Result PhonemeTiming::load(const DnniReader& reader, std::size_t rootNode)
     }
 
     // Normalizers
-    if (const auto result = inputNormalization.load(reader, frontend.children[6]); result.failed())
+    if (const auto result = inputNormalization.load(reader, inputNormNode); result.failed())
     {
         return result;
     }
-    if (const auto result = outputNormalization.load(reader, frontend.children[7]); result.failed())
+    if (const auto result = outputNormalization.load(reader, outputNormNode); result.failed())
     {
         return result;
     }
@@ -315,7 +453,10 @@ juce::Result PhonemeTiming::predict(std::span<const TimingSyllable> syllables, s
         const auto& syllable = syllables[syllableIndex];
         phonemeCount += syllable.phonemes.size();
 
-        // Match syllable language to known phone sets
+        // Match syllable language to known phone sets.
+        // 官方声库的 phoneset 命名为 "<language>-<scheme>-phones"（实测 japanese-romaji-phones、
+        // mandarin-xsampa-phones、korean-xsampa-phones 等），而工程里的 language 只有
+        // "japanese" 这种短名。因此先精确匹配，失配时再按 "<language>-" 前缀匹配。
         std::size_t languageIndex = phoneSets.size();
         for (std::size_t index = 0; index < phoneSets.size(); ++index)
         {
@@ -330,7 +471,29 @@ juce::Result PhonemeTiming::predict(std::span<const TimingSyllable> syllables, s
         }
         if (languageIndex == phoneSets.size())
         {
-            return failure("unknown phoneme language: " + juce::String::fromUTF8(syllable.language.c_str()));
+            const std::string prefix = syllable.language + "-";
+            std::size_t candidates = 0;
+            for (std::size_t index = 0; index < phoneSets.size(); ++index)
+            {
+                if (phoneSets[index].name.starts_with(prefix))
+                {
+                    if (candidates == 0)
+                    {
+                        languageIndex = index;
+                    }
+                    ++candidates;
+                }
+            }
+        }
+        if (languageIndex == phoneSets.size())
+        {
+            juce::String available;
+            for (const auto& ps : phoneSets)
+            {
+                available << " '" << ps.name << "'";
+            }
+            return failure("unknown phoneme language: " + juce::String::fromUTF8(syllable.language.c_str())
+                           + " ; voicebank provides:" + available);
         }
 
         const auto& phoneSet = phoneSets[languageIndex];
