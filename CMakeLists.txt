@@ -88,6 +88,9 @@ add_library(OpenSVEngine STATIC
     src/synthesis/LipRadiation.cpp
 )
 target_include_directories(OpenSVEngine PUBLIC src)
+# The VST3 plugin links this static lib into a shared module; GUI/CLI tolerate
+# it too, so PIC unconditionally.
+set_target_properties(OpenSVEngine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_definitions(OpenSVEngine PUBLIC JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
 target_link_libraries(OpenSVEngine PRIVATE
     juce::juce_core
@@ -131,6 +134,36 @@ if(OPENSV_BUILD_PLUGIN_VST3)
 endif()
 
 option(OPENSV_BUILD_INTERNAL_TOOLS "Build internal voice diagnostics" OFF)
+
+option(OPENSV_BUILD_TESTS "Build plugin headless smoke tests" ON)
+if(OPENSV_BUILD_TESTS)
+    juce_add_console_app(OpenSVEngineSmoke
+        PRODUCT_NAME "opensv-engine-smoke"
+        COMPANY_NAME "OpenSV"
+        BUNDLE_ID "org.opensv.smoke"
+    )
+    set_target_properties(OpenSVEngineSmoke PROPERTIES OUTPUT_NAME "opensv-engine-smoke")
+    target_sources(OpenSVEngineSmoke PRIVATE
+        tests/plugin/EngineSmokeTest.cpp
+        plugin/src/EngineBridge.cpp
+    )
+    target_include_directories(OpenSVEngineSmoke PRIVATE plugin/src)
+    target_compile_definitions(OpenSVEngineSmoke PRIVATE
+        JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
+    target_link_libraries(OpenSVEngineSmoke PRIVATE
+        OpenSVEngine
+        juce::juce_core
+        juce::juce_events
+        juce::juce_audio_basics
+        juce::juce_audio_formats
+        juce::juce_dsp
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_warning_flags
+    )
+    if(MSVC)
+        target_compile_options(OpenSVEngineSmoke PRIVATE /utf-8 /permissive- /EHsc)
+    endif()
+endif()
 if(OPENSV_BUILD_INTERNAL_TOOLS)
     juce_add_console_app(OpenSVVoice
         PRODUCT_NAME "opensv-voice"

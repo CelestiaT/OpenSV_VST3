@@ -11,8 +11,11 @@
 
 #include <array>
 #include <atomic>
+#include <map>
 
 #include <juce_audio_processors/juce_audio_processors.h>
+
+#include "EngineBridge.h"
 
 namespace opensv::plugin
 {
@@ -63,7 +66,7 @@ public:
 
 private:
     void timerCallback() override; // message-thread logging; no GUI
-    void handleMidi(juce::MidiBuffer&);
+    void handleMidi(juce::MidiBuffer&, std::int64_t blockStartSample, double sampleRate);
     void handleSyncTrigger();
 
     template <typename FloatType>
@@ -108,6 +111,15 @@ private:
 
     std::int64_t lastLoggedBlocks = 0;
     bool lastSyncTriggerValue = false;
+
+    // ---- M2: engine wiring -------------------------------------------------
+    EngineBridge engine;
+    juce::CriticalSection pendingNotesCS;
+    std::vector<EngineBridge::NoteRec> pendingNotes;   // guarded by pendingNotesCS
+    std::map<int, double> openNoteTimes;               // audio-thread only
+    std::int64_t fallbackPosSample = 0;                // when host gives no position
+    bool lastTransportPlaying = false;
+    juce::Time lastConfigCheck{};
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(OpenSVProcessor)
 };

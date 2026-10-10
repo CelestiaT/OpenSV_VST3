@@ -19,6 +19,7 @@ juce_add_plugin(OpenSVVst3
 
 target_sources(OpenSVVst3 PRIVATE
     src/OpenSVProcessor.cpp
+    src/EngineBridge.cpp
 )
 target_include_directories(OpenSVVst3 PRIVATE src)
 

@@ -88,7 +88,9 @@ OpenSVProcessor::OpenSVProcessor()
     addParameter(syncNow.release());
 
     startTimerHz(1);
-    logLine("OpenSV VST3 created (M1 shell, headless)");
+    if (const juce::File cfgFile = EngineBridge::defaultConfigFile(); cfgFile.existsAsFile())
+        engine.loadConfigFile(cfgFile);
+    logLine("OpenSV VST3 created (M2 engine bridge, headless)");
 }
 
 OpenSVProcessor::~OpenSVProcessor()
@@ -103,6 +105,13 @@ void OpenSVProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     for (auto& voice : testVoices)
         voice = {};
+    fallbackPosSample = 0;
+    openNoteTimes.clear();
+    {
+        const juce::ScopedLock lock(pendingNotesCS);
+        pendingNotes.clear();
+    }
+    engine.setSampleRate(sampleRate);
     logLine(juce::String("prepareToPlay fs=") + juce::String(sampleRate, 1)
         + " block=" + juce::String(samplesPerBlock));
 }
@@ -129,14 +138,21 @@ void OpenSVProcessor::processBuffer(juce::AudioBuffer<FloatType>& buffer, juce::
     controls.attenuation = attenuationParam != nullptr ? attenuationParam->get() : 0.8f;
     controls.testTone = testToneParam != nullptr && testToneParam->get();
 
-    // Transport probing (M1 risk R2: confirm what MuseScore exposes through
-    // the JUCE wrapper of VstProcessContext.projectTimeSamples, docs F-4).
+    // Transport: prefer the host-provided absolute position (M1 risk R2:
+    // MuseScore fills VstProcessContext.projectTimeSamples; JUCE exposes it as
+    // PositionInfo::getTimeInSamples()). Fall back to our accumulated counter.
+    std::int64_t blockStartSample = fallbackPosSample;
+    bool hostProvidedPos = false;
     if (auto* playHead = getPlayHead())
     {
         if (auto position = playHead->getPosition())
         {
             if (auto samplePos = position->getTimeInSamples())
-                lastSamplePos.store(static_cast<std::int64_t>(*samplePos));
+            {
+                blockStartSample = static_cast<std::int64_t>(*samplePos);
+                hostProvidedPos = true;
+                lastSamplePos.store(blockStartSample);
+            }
             if (auto ppq = position->getPpqPosition())
                 lastPpqPos.store(static_cast<std::int64_t>(std::llround(*ppq)));
             if (auto bpm = position->getBpm())
@@ -144,13 +160,25 @@ void OpenSVProcessor::processBuffer(juce::AudioBuffer<FloatType>& buffer, juce::
             lastPlaying.store(position->getIsPlaying());
         }
     }
+    if (!hostProvidedPos)
+        fallbackPosSample += numSamples;
 
-    handleMidi(midi);
+    handleMidi(midi, blockStartSample, sampleRate);
     handleSyncTrigger();
 
     buffer.clear(0, 0, numSamples);
 
-    if (controls.testTone)
+    // Engine path: whole-song render, sampled by absolute position. Only the
+    // float bus is wired (MuseScore drives plugins in kSample32).
+    bool engineProduced = false;
+    if constexpr (std::is_same_v<FloatType, float>)
+        engineProduced = engine.renderInto(buffer, blockStartSample);
+
+    if (engineProduced)
+    {
+        buffer.applyGain(0, numSamples, controls.attenuation);
+    }
+    else if (controls.testTone)
     {
         const double gain = static_cast<double>(controls.attenuation) * 0.25;
         const double attackInc = 1.0 / (kAttackSeconds * sampleRate);
@@ -197,15 +225,17 @@ void OpenSVProcessor::processBlock(juce::AudioBuffer<double>& buffer, juce::Midi
     processBuffer(buffer, midi);
 }
 
-void OpenSVProcessor::handleMidi(juce::MidiBuffer& midi)
+void OpenSVProcessor::handleMidi(juce::MidiBuffer& midi, const std::int64_t blockStartSample, const double sampleRate)
 {
     for (const auto message : midi)
     {
         const juce::MidiMessage& mm = message.getMessage();
+        const double eventSec = static_cast<double>(blockStartSample + message.samplePosition) / sampleRate;
 
         if (mm.isNoteOn())
         {
             const int pitch = mm.getNoteNumber();
+            openNoteTimes[pitch] = eventSec; // engine collection (last wins)
 
             int slot = -1;
             for (std::size_t i = 0; i < testVoices.size(); ++i)
@@ -238,6 +268,12 @@ void OpenSVProcessor::handleMidi(juce::MidiBuffer& midi)
         else if (mm.isNoteOff())
         {
             const int pitch = mm.getNoteNumber();
+            if (const auto it = openNoteTimes.find(pitch); it != openNoteTimes.end())
+            {
+                const juce::ScopedLock lock(pendingNotesCS);
+                pendingNotes.push_back({ it->second, eventSec, pitch });
+                openNoteTimes.erase(it);
+            }
             for (auto& voice : testVoices)
                 if (voice.active && voice.pitch == pitch)
                     voice.active = false;
@@ -348,14 +384,65 @@ juce::String OpenSVProcessor::probeSummary() const
 
 void OpenSVProcessor::timerCallback()
 {
-    // Message-thread reporter: one line per second whenever audio activity
-    // changed, so docs/M1-VALIDATION.md can correlate the host ruler with the
-    // values we probe.
+    // ---- config watch (voice bank swap without restart) ----
+    static juce::Time nextConfigCheck{};
+    const juce::Time now = juce::Time::getCurrentTime();
+    if (now >= nextConfigCheck)
+    {
+        nextConfigCheck = now + juce::RelativeTime::seconds(1.0);
+        if (const juce::File cfgFile = EngineBridge::defaultConfigFile(); cfgFile.existsAsFile())
+        {
+            static juce::int64 lastMtime = -1;
+            const juce::int64 mtime = cfgFile.getLastModificationTime().toMilliseconds();
+            if (mtime != lastMtime)
+            {
+                lastMtime = mtime;
+                engine.loadConfigFile(cfgFile);
+                logLine("config reloaded: voice=" + juce::String(engine.config().voiceBank));
+            }
+        }
+    }
+
+    // ---- commit collected notes when transport stops (and on demand) ----
+    const bool playing = lastPlaying.load();
+    const bool stoppedNow = lastTransportPlaying && !playing;
+    lastTransportPlaying = playing;
+
+    std::int64_t syncCount = syncRequests.load();
+    static std::int64_t lastSyncCount = 0;
+    const bool syncPressed = syncCount != lastSyncCount;
+    lastSyncCount = syncCount;
+
+    if (stoppedNow || syncPressed)
+    {
+        std::vector<EngineBridge::NoteRec> snapshot;
+        {
+            const juce::ScopedLock lock(pendingNotesCS);
+            snapshot = pendingNotes; // keep for repeat commits until re-collected
+        }
+        if (!snapshot.empty())
+        {
+            engine.setNotes(std::move(snapshot));
+            engine.commitAndRender();
+            logLine(juce::String("committed ") + juce::String(static_cast<int>(snapshot.size()))
+                + " notes -> render requested");
+        }
+    }
+
+    // ---- transport/activity log (throttled) ----
     const std::int64_t blocks = processBlockCounter.load();
     if (blocks != lastLoggedBlocks)
     {
         lastLoggedBlocks = blocks;
-        logLine("transport: " + probeSummary());
+        juce::String line = "transport: " + probeSummary();
+        const auto st = engine.status();
+        const char* state = st.hasAudio ? "audio" : (st.rendering ? "RENDERING" : "idle");
+        line += " | engine: ";
+        line += state;
+        line += " song=" + juce::String(st.songSeconds, 1) + "s";
+        if (st.error.isNotEmpty())
+            line += " ERR=" + st.error;
+        logLine(line);
     }
 }
 
